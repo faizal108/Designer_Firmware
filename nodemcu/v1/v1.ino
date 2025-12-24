@@ -39,13 +39,12 @@ struct EncoderScaleConfig {
 
 const EncoderScaleConfig ENCODER_SCALE = {
   .pointsPerConfiguredDistance = 360,
-  .configuredDistance_mm       = 10
+  .configuredDistance_mm = 10
 };
 
 // Derived (computed, NOT hard-coded)
 const int32_t POINTS_PER_MM =
-  ENCODER_SCALE.pointsPerConfiguredDistance /
-  ENCODER_SCALE.configuredDistance_mm;
+  ENCODER_SCALE.pointsPerConfiguredDistance / ENCODER_SCALE.configuredDistance_mm;
 
 /* ============================================================
    3. SAMPLING / OUTPUT RESOLUTION CONFIGURATION
@@ -56,7 +55,7 @@ const int32_t POINTS_PER_MM =
   This is NOT unit conversion.
 */
 struct SamplingConfig {
-  int32_t emitEvery_mm;   // e.g. 1 = every 1 mm
+  int32_t emitEvery_mm;  // e.g. 1 = every 1 mm
 };
 
 const SamplingConfig SAMPLING = {
@@ -71,7 +70,7 @@ const int32_t POINTS_PER_EMIT_STEP =
    ============================================================ */
 
 #ifndef QUEUE_ORDER
-#define QUEUE_ORDER 10     // 2^10 = 1024 entries
+#define QUEUE_ORDER 10  // 2^10 = 1024 entries
 #endif
 
 const size_t QUEUE_SIZE = (1UL << QUEUE_ORDER);
@@ -81,10 +80,10 @@ const size_t QUEUE_MASK = QUEUE_SIZE - 1;
    5. DATA STRUCTURES
    ============================================================ */
 
-struct PointMM100 {
+typedef struct {
   int32_t x;
   int32_t y;
-};
+} PointMM100;
 
 volatile PointMM100 ringBuffer[QUEUE_SIZE];
 volatile uint32_t bufferHead = 0;
@@ -121,10 +120,10 @@ const uint32_t Y_B_MASK = digitalPinToBitMask(Y_AXIS.b);
    ============================================================ */
 
 const int8_t QUAD_TRANSITION[16] = {
-   0,  1, -1,  0,
-  -1,  0,  0,  1,
-   1,  0,  0, -1,
-   0, -1,  1,  0
+  0, 1, -1, 0,
+  -1, 0, 0, 1,
+  1, 0, 0, -1,
+  0, -1, 1, 0
 };
 
 /* ============================================================
@@ -158,8 +157,8 @@ ICACHE_RAM_ATTR void handleEncoderY() {
 inline int32_t pointsToMM100(int32_t points) {
   int64_t scaled = (int64_t)points * 100;
   return (scaled >= 0)
-         ? (scaled + POINTS_PER_MM / 2) / POINTS_PER_MM
-         : (scaled - POINTS_PER_MM / 2) / POINTS_PER_MM;
+           ? (scaled + POINTS_PER_MM / 2) / POINTS_PER_MM
+           : (scaled - POINTS_PER_MM / 2) / POINTS_PER_MM;
 }
 
 /* ============================================================
@@ -168,39 +167,51 @@ inline int32_t pointsToMM100(int32_t points) {
 
 void enqueuePoint(int32_t x_mm100, int32_t y_mm100) {
   noInterrupts();
+
   if (bufferCount == QUEUE_SIZE) {
     bufferTail = (bufferTail + 1) & QUEUE_MASK;
     bufferCount--;
   }
-  ringBuffer[bufferHead] = { x_mm100, y_mm100 };
+
+  ringBuffer[bufferHead].x = x_mm100;
+  ringBuffer[bufferHead].y = y_mm100;
+
   bufferHead = (bufferHead + 1) & QUEUE_MASK;
   bufferCount++;
+
   interrupts();
 }
 
-bool dequeuePoint(PointMM100 &out) {
+bool dequeuePoint(PointMM100 *out) {
   noInterrupts();
-  if (!bufferCount) {
+
+  if (bufferCount == 0) {
     interrupts();
     return false;
   }
-  out = ringBuffer[bufferTail];
+
+  out->x = ringBuffer[bufferTail].x;
+  out->y = ringBuffer[bufferTail].y;
+
   bufferTail = (bufferTail + 1) & QUEUE_MASK;
   bufferCount--;
+
   interrupts();
   return true;
 }
+
 
 /* ============================================================
    12. SERIAL OUTPUT
    ============================================================ */
 
-void sendPoint(const PointMM100 &p) {
-  Serial.printf("%ld.%02ld,%ld.%02ld\n",
-    p.x / 100, abs(p.x % 100),
-    p.y / 100, abs(p.y % 100)
-  );
+void sendPoint(const PointMM100 *p) {
+  Serial.printf(
+    "%ld.%02ld,%ld.%02ld\n",
+    p->x / 100, abs(p->x % 100),
+    p->y / 100, abs(p->y % 100));
 }
+
 
 /* ============================================================
    13. COMMAND PROCESSOR (SCALABLE)
@@ -213,7 +224,7 @@ void processCommand(const String &rawCmd) {
 
   // ---- Backward-compatible aliases ----
   if (cmd == "record") cmd = "record:start";
-  if (cmd == "stop")   cmd = "record:stop";
+  if (cmd == "stop") cmd = "record:stop";
 
   // ---- Command handling ----
   if (cmd == "record:start") {
@@ -245,8 +256,7 @@ void processCommand(const String &rawCmd) {
       pointsToMM100(x) / 100, abs(pointsToMM100(x) % 100),
       pointsToMM100(y) / 100, abs(pointsToMM100(y) % 100),
       bufferCount,
-      SAMPLING.emitEvery_mm
-    );
+      SAMPLING.emitEvery_mm);
     return;
   }
 
@@ -263,9 +273,8 @@ void setup() {
 
   Serial.println("\nESP8266 Encoder Streaming Ready");
   Serial.printf("Scale: %d points = %d mm\n",
-    ENCODER_SCALE.pointsPerConfiguredDistance,
-    ENCODER_SCALE.configuredDistance_mm
-  );
+                ENCODER_SCALE.pointsPerConfiguredDistance,
+                ENCODER_SCALE.configuredDistance_mm);
   Serial.printf("Resolution: %d mm\n", SAMPLING.emitEvery_mm);
   Serial.println("Commands: record:start | record:stop | status");
 
@@ -300,8 +309,7 @@ void loop() {
     y = encoderY_points;
     interrupts();
 
-    if (abs(x - lastEmittedX_points) >= POINTS_PER_EMIT_STEP ||
-        abs(y - lastEmittedY_points) >= POINTS_PER_EMIT_STEP) {
+    if (abs(x - lastEmittedX_points) >= POINTS_PER_EMIT_STEP || abs(y - lastEmittedY_points) >= POINTS_PER_EMIT_STEP) {
 
       lastEmittedX_points = x;
       lastEmittedY_points = y;
@@ -311,8 +319,8 @@ void loop() {
   }
 
   PointMM100 p;
-  while (dequeuePoint(p)) {
-    sendPoint(p);
+  while (dequeuePoint(&p)) {
+    sendPoint(&p);
     yield();
   }
 
