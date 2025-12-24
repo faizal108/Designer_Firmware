@@ -206,35 +206,41 @@ void sendPoint(const PointMM100 &p) {
    13. COMMAND PROCESSOR (SCALABLE)
    ============================================================ */
 
-void processCommand(const String &cmd) {
-  String c = cmd;
-  c.trim();
-  c.toLowerCase();
+void processCommand(const String &rawCmd) {
+  String cmd = rawCmd;
+  cmd.trim();
+  cmd.toLowerCase();
 
-  if (c == "record:start") {
+  // ---- Backward-compatible aliases ----
+  if (cmd == "record") cmd = "record:start";
+  if (cmd == "stop")   cmd = "record:stop";
+
+  // ---- Command handling ----
+  if (cmd == "record:start") {
     noInterrupts();
     lastEmittedX_points = encoderX_points;
     lastEmittedY_points = encoderY_points;
     interrupts();
+
     isRecording = true;
     Serial.println("OK RECORDING STARTED");
     return;
   }
 
-  if (c == "record:stop") {
+  if (cmd == "record:stop") {
     isRecording = false;
     Serial.println("OK RECORDING STOPPED");
     return;
   }
 
-  if (c == "status") {
+  if (cmd == "status") {
     noInterrupts();
     int32_t x = encoderX_points;
     int32_t y = encoderY_points;
     interrupts();
 
     Serial.printf(
-      "STATUS | X=%ld Y=%ld | mm=(%ld.%02ld,%ld.%02ld) | Q=%u | RES=%dmm\n",
+      "STATUS | raw=(%ld,%ld) | mm=(%ld.%02ld,%ld.%02ld) | q=%u | res=%dmm\n",
       x, y,
       pointsToMM100(x) / 100, abs(pointsToMM100(x) % 100),
       pointsToMM100(y) / 100, abs(pointsToMM100(y) % 100),
