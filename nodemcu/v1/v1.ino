@@ -1,512 +1,314 @@
-
-// ==================================================VERSION-2============================================
-
 /*
-  Robust ESP8266 Quadrature → mm (0.1 mm resolution)
-  - Keeps your original logic (encX/encY are "points")
-  - Adds startup debounce/stabilization and WDT-friendly yields
-  - Removes possible boot-time queue spam by seeding lastSentPoints
+  ============================================================
+  ESP8266 Quadrature Encoder → Position Streaming (mm)
+  ============================================================
+
+  Key Properties:
+  - Encoder produces FIXED points per mechanical distance
+  - Resolution controls WHEN a point is emitted, not conversion
+  - No hard-coded magic numbers in logic
+  - Config-first, scalable, production-friendly structure
 */
 
 #include <Arduino.h>
 
-// ---- Pins (NodeMCU safe) ----
-const uint8_t X_A_PIN = D1;  // GPIO5
-const uint8_t X_B_PIN = D2;  // GPIO4
-const uint8_t Y_A_PIN = D5;  // GPIO14
-const uint8_t Y_B_PIN = D6;  // GPIO12
+/* ============================================================
+   1. HARDWARE PIN CONFIGURATION
+   ============================================================ */
 
-// ---- Queue config (power-of-two) ----
+struct EncoderPins {
+  uint8_t a;
+  uint8_t b;
+};
+
+const EncoderPins X_AXIS = { D1, D2 };  // GPIO5, GPIO4
+const EncoderPins Y_AXIS = { D5, D6 };  // GPIO14, GPIO12
+
+/* ============================================================
+   2. ENCODER & MECHANICAL CONFIGURATION
+   ============================================================ */
+
+/*
+  Mechanical truth:
+    360 encoder points = 10 mm = 1 cm
+*/
+struct EncoderScaleConfig {
+  int32_t pointsPerConfiguredDistance;
+  int32_t configuredDistance_mm;
+};
+
+const EncoderScaleConfig ENCODER_SCALE = {
+  .pointsPerConfiguredDistance = 360,
+  .configuredDistance_mm       = 10
+};
+
+// Derived (computed, NOT hard-coded)
+const int32_t POINTS_PER_MM =
+  ENCODER_SCALE.pointsPerConfiguredDistance /
+  ENCODER_SCALE.configuredDistance_mm;
+
+/* ============================================================
+   3. SAMPLING / OUTPUT RESOLUTION CONFIGURATION
+   ============================================================ */
+
+/*
+  Controls WHEN a new point is emitted.
+  This is NOT unit conversion.
+*/
+struct SamplingConfig {
+  int32_t emitEvery_mm;   // e.g. 1 = every 1 mm
+};
+
+const SamplingConfig SAMPLING = {
+  .emitEvery_mm = 1
+};
+
+const int32_t POINTS_PER_EMIT_STEP =
+  SAMPLING.emitEvery_mm * POINTS_PER_MM;
+
+/* ============================================================
+   4. RING BUFFER CONFIGURATION
+   ============================================================ */
+
 #ifndef QUEUE_ORDER
-#define QUEUE_ORDER 10  // 1024 entries (~8 KB)
+#define QUEUE_ORDER 10     // 2^10 = 1024 entries
 #endif
+
 const size_t QUEUE_SIZE = (1UL << QUEUE_ORDER);
 const size_t QUEUE_MASK = QUEUE_SIZE - 1;
 
-// ---- Buffer struct holds mm*100 values ----
-struct Point {
-  int32_t x_mm100;
-  int32_t y_mm100;
+/* ============================================================
+   5. DATA STRUCTURES
+   ============================================================ */
+
+struct PointMM100 {
+  int32_t x;
+  int32_t y;
 };
 
-// ring buffer (volatile because ISR/loop can access)
-volatile Point ringBuf[QUEUE_SIZE];
-volatile uint32_t bufHead = 0;
-volatile uint32_t bufTail = 0;
-volatile uint32_t bufCount = 0;
+volatile PointMM100 ringBuffer[QUEUE_SIZE];
+volatile uint32_t bufferHead = 0;
+volatile uint32_t bufferTail = 0;
+volatile uint32_t bufferCount = 0;
 
-// ---- Encoder raw counters (these are already "points" in your setup) ----
-volatile int32_t encX = 0;
-volatile int32_t encY = 0;
+/* ============================================================
+   6. ENCODER STATE
+   ============================================================ */
 
-// ---- previous A/B states ----
-volatile uint8_t prevX = 0;
-volatile uint8_t prevY = 0;
+volatile int32_t encoderX_points = 0;
+volatile int32_t encoderY_points = 0;
 
-// ---- recording flag ----
-volatile bool recording = false;
+volatile uint8_t prevXState = 0;
+volatile uint8_t prevYState = 0;
 
-// ---- last-sent points sentinel (points units) ----
-volatile int32_t lastSentPointsX = 0x7FFFFFFF;
-volatile int32_t lastSentPointsY = 0x7FFFFFFF;
+volatile bool isRecording = false;
 
-// ---- mapping / thresholds ----
-// 360 points = 1 mm  => POINTS_PER_MM = 360
-const int32_t POINTS_PER_MM = 360;       // points per 1 mm
-const int32_t POINTS_PER_HALF_MM = 36;  // 0.1 mm threshold (in points)
-// conversion: mm100 = round(points * 100 / POINTS_PER_MM)
+/* Sentinel used to detect first sample after record start */
+volatile int32_t lastEmittedX_points = INT32_MAX;
+volatile int32_t lastEmittedY_points = INT32_MAX;
 
-// ---- masks for fast GPIO read ----
-const uint32_t X_A_MASK = digitalPinToBitMask(X_A_PIN);
-const uint32_t X_B_MASK = digitalPinToBitMask(X_B_PIN);
-const uint32_t Y_A_MASK = digitalPinToBitMask(Y_A_PIN);
-const uint32_t Y_B_MASK = digitalPinToBitMask(Y_B_PIN);
+/* ============================================================
+   7. FAST GPIO ACCESS
+   ============================================================ */
 
-// ---- transition table (prev<<2 | curr) -> -1/0/+1 ----
-const int8_t transTable[16] = {
-  0, 1, -1, 0,
-  -1, 0, 0, 1,
-  1, 0, 0, -1,
-  0, -1, 1, 0
+const uint32_t X_A_MASK = digitalPinToBitMask(X_AXIS.a);
+const uint32_t X_B_MASK = digitalPinToBitMask(X_AXIS.b);
+const uint32_t Y_A_MASK = digitalPinToBitMask(Y_AXIS.a);
+const uint32_t Y_B_MASK = digitalPinToBitMask(Y_AXIS.b);
+
+/* ============================================================
+   8. QUADRATURE TRANSITION TABLE
+   ============================================================ */
+
+const int8_t QUAD_TRANSITION[16] = {
+   0,  1, -1,  0,
+  -1,  0,  0,  1,
+   1,  0,  0, -1,
+   0, -1,  1,  0
 };
 
-// ---- Startup stabilization period (ms) ----
-const uint32_t STARTUP_STABLE_MS = 200;  // adjust up if board bounce persists
+/* ============================================================
+   9. ISR IMPLEMENTATION
+   ============================================================ */
 
-// ---- ISR: update counters only (kept minimal) ----
-ICACHE_RAM_ATTR void isrX() {
-  uint32_t in = GPIO_REG_READ(GPIO_IN_ADDRESS);
-  uint8_t a = (in & X_A_MASK) ? 1 : 0;
-  uint8_t b = (in & X_B_MASK) ? 1 : 0;
-  uint8_t curr = (a << 1) | b;
-  uint8_t idx = (prevX << 2) | curr;
-  int8_t d = transTable[idx];
-  if (d != 0) {
-    encX += d;
-    prevX = curr;
-  } else {
-    if (curr != prevX) prevX = curr;
-  }
-}
-ICACHE_RAM_ATTR void isrY() {
-  uint32_t in = GPIO_REG_READ(GPIO_IN_ADDRESS);
-  uint8_t a = (in & Y_A_MASK) ? 1 : 0;
-  uint8_t b = (in & Y_B_MASK) ? 1 : 0;
-  uint8_t curr = (a << 1) | b;
-  uint8_t idx = (prevY << 2) | curr;
-  int8_t d = transTable[idx];
-  if (d != 0) {
-    encY += d;
-    prevY = curr;
-  } else {
-    if (curr != prevY) prevY = curr;
-  }
+ICACHE_RAM_ATTR void handleEncoderX() {
+  uint32_t gpio = GPIO_REG_READ(GPIO_IN_ADDRESS);
+  uint8_t curr = ((gpio & X_A_MASK) ? 2 : 0) | ((gpio & X_B_MASK) ? 1 : 0);
+  uint8_t idx = (prevXState << 2) | curr;
+  int8_t delta = QUAD_TRANSITION[idx];
+
+  if (delta != 0) encoderX_points += delta;
+  prevXState = curr;
 }
 
-// ---- Push into ring buffer from main (atomic) ----
-void pushPointMain(int32_t x_mm100, int32_t y_mm100) {
+ICACHE_RAM_ATTR void handleEncoderY() {
+  uint32_t gpio = GPIO_REG_READ(GPIO_IN_ADDRESS);
+  uint8_t curr = ((gpio & Y_A_MASK) ? 2 : 0) | ((gpio & Y_B_MASK) ? 1 : 0);
+  uint8_t idx = (prevYState << 2) | curr;
+  int8_t delta = QUAD_TRANSITION[idx];
+
+  if (delta != 0) encoderY_points += delta;
+  prevYState = curr;
+}
+
+/* ============================================================
+   10. CONVERSION UTILITIES
+   ============================================================ */
+
+inline int32_t pointsToMM100(int32_t points) {
+  int64_t scaled = (int64_t)points * 100;
+  return (scaled >= 0)
+         ? (scaled + POINTS_PER_MM / 2) / POINTS_PER_MM
+         : (scaled - POINTS_PER_MM / 2) / POINTS_PER_MM;
+}
+
+/* ============================================================
+   11. RING BUFFER HELPERS
+   ============================================================ */
+
+void enqueuePoint(int32_t x_mm100, int32_t y_mm100) {
   noInterrupts();
-  if (bufCount == QUEUE_SIZE) {
-    // overwrite oldest
-    bufTail = (bufTail + 1) & QUEUE_MASK;
-    bufCount--;
+  if (bufferCount == QUEUE_SIZE) {
+    bufferTail = (bufferTail + 1) & QUEUE_MASK;
+    bufferCount--;
   }
-  ringBuf[bufHead].x_mm100 = x_mm100;
-  ringBuf[bufHead].y_mm100 = y_mm100;
-  bufHead = (bufHead + 1) & QUEUE_MASK;
-  bufCount++;
+  ringBuffer[bufferHead] = { x_mm100, y_mm100 };
+  bufferHead = (bufferHead + 1) & QUEUE_MASK;
+  bufferCount++;
   interrupts();
 }
 
-// ---- Pop from ring buffer (atomic) ----
-bool popPointMain(Point &out) {
-  bool ok = false;
+bool dequeuePoint(PointMM100 &out) {
   noInterrupts();
-  if (bufCount > 0) {
-    out.x_mm100 = ringBuf[bufTail].x_mm100;
-    out.y_mm100 = ringBuf[bufTail].y_mm100;
-    bufTail = (bufTail + 1) & QUEUE_MASK;
-    bufCount--;
-    ok = true;
+  if (!bufferCount) {
+    interrupts();
+    return false;
   }
+  out = ringBuffer[bufferTail];
+  bufferTail = (bufferTail + 1) & QUEUE_MASK;
+  bufferCount--;
   interrupts();
-  return ok;
+  return true;
 }
 
-uint32_t getQueueCount() {
-  uint32_t c;
-  noInterrupts();
-  c = bufCount;
-  interrupts();
-  return c;
+/* ============================================================
+   12. SERIAL OUTPUT
+   ============================================================ */
+
+void sendPoint(const PointMM100 &p) {
+  Serial.printf("%ld.%02ld,%ld.%02ld\n",
+    p.x / 100, abs(p.x % 100),
+    p.y / 100, abs(p.y % 100)
+  );
 }
 
-// ---- integer math conversion: points -> mm*100 (rounded) ----
-ICACHE_RAM_ATTR int32_t points_to_mm100(int32_t points) {
-  // mm100 = round(points * 100 / POINTS_PER_MM)
-  int64_t prod = (int64_t)points * 100LL;
-  if (prod >= 0) return (int32_t)((prod + POINTS_PER_MM / 2) / POINTS_PER_MM);
-  else return (int32_t)((prod - POINTS_PER_MM / 2) / POINTS_PER_MM);
-}
+/* ============================================================
+   13. COMMAND PROCESSOR (SCALABLE)
+   ============================================================ */
 
-// ---- fast int-to-ascii for positive numbers (helper for fractional) ----
-char *intToAsciiNoSign(uint32_t u, char *dest) {
-  char tmp[12];
-  int idx = 0;
-  if (u == 0) tmp[idx++] = '0';
-  while (u > 0) {
-    tmp[idx++] = '0' + (u % 10);
-    u /= 10;
-  }
-  char *p = dest;
-  for (int i = idx - 1; i >= 0; --i) *p++ = tmp[i];
-  return p;
-}
+void processCommand(const String &cmd) {
+  String c = cmd;
+  c.trim();
+  c.toLowerCase();
 
-// ---- write mm100 into buffer as "int.frac" with sign ----
-char *format_mm100_into(int32_t mm100, char *p) {
-  if (mm100 < 0) {
-    *p++ = '-';
-    mm100 = -mm100;
-  }
-  uint32_t ip = (uint32_t)(mm100 / 100);
-  uint32_t frac = (uint32_t)(mm100 % 100);
-  p = intToAsciiNoSign(ip, p);
-  *p++ = '.';
-  *p++ = '0' + (frac / 10);
-  *p++ = '0' + (frac % 10);
-  return p;
-}
-
-// ---- send Point as "X.mm,Y.mm\n" ----
-void sendXY(const Point &pt) {
-  char buf[32];
-  char *q = buf;
-  q = format_mm100_into(pt.x_mm100, q);
-  *q++ = ',';
-  q = format_mm100_into(pt.y_mm100, q);
-  *q++ = '\n';
-  Serial.write((const uint8_t *)buf, q - buf);
-}
-
-// ---- Serial command handler ----
-// ---- Serial command handler ----
-void handleSerialCommand(String cmd) {
-  cmd.trim();
-  String l = cmd;
-  l.toLowerCase();
-
-  if (l == "record") {
-    // atomically sample current encoder points
-    int32_t curX_points, curY_points;
+  if (c == "record:start") {
     noInterrupts();
-    curX_points = encX;  // encX is already in points
-    curY_points = encY;
-    // seed lastSentPoints so first movement is relative to this instant
-    lastSentPointsX = curX_points;
-    lastSentPointsY = curY_points;
+    lastEmittedX_points = encoderX_points;
+    lastEmittedY_points = encoderY_points;
+    interrupts();
+    isRecording = true;
+    Serial.println("OK RECORDING STARTED");
+    return;
+  }
+
+  if (c == "record:stop") {
+    isRecording = false;
+    Serial.println("OK RECORDING STOPPED");
+    return;
+  }
+
+  if (c == "status") {
+    noInterrupts();
+    int32_t x = encoderX_points;
+    int32_t y = encoderY_points;
     interrupts();
 
-    // convert to mm*100 and send immediately
-    Point p;
-    p.x_mm100 = points_to_mm100(curX_points);
-    p.y_mm100 = points_to_mm100(curY_points);
-    // send immediately so host gets the instant point
-    sendXY(p);
-
-    recording = true;
-    Serial.println("Recording started.");
+    Serial.printf(
+      "STATUS | X=%ld Y=%ld | mm=(%ld.%02ld,%ld.%02ld) | Q=%u | RES=%dmm\n",
+      x, y,
+      pointsToMM100(x) / 100, abs(pointsToMM100(x) % 100),
+      pointsToMM100(y) / 100, abs(pointsToMM100(y) % 100),
+      bufferCount,
+      SAMPLING.emitEvery_mm
+    );
     return;
   }
 
-  if (l == "stop") {
-    // atomically sample current encoder points
-    // int32_t curX_points, curY_points;
-    // noInterrupts();
-    // curX_points = encX;
-    // curY_points = encY;
-    // interrupts();
-
-    // convert to mm*100 and send immediately before stopping
-    // Point p;
-    // p.x_mm100 = points_to_mm100(curX_points);
-    // p.y_mm100 = points_to_mm100(curY_points);
-    // sendXY(p);
-
-    recording = false;
-    // reset sentinel so next record will reseed from the then-current position
-    // noInterrupts();
-    // lastSentPointsX = 0x7FFFFFFF;
-    // lastSentPointsY = 0x7FFFFFFF;
-    // interrupts();
-
-    Serial.println("Recording stopped.");
-    return;
-  }
-
-  if (l == "status") {
-    int32_t x_points, y_points, x_mm100, y_mm100;
-    int32_t x_counts, y_counts;  // same as points for your setup
-    uint32_t q;
-    bool rec;
-    noInterrupts();
-    x_counts = encX;
-    y_counts = encY;
-    x_points = x_counts;
-    y_points = y_counts;  // enc counts are points already
-    x_mm100 = points_to_mm100(x_points);
-    y_mm100 = points_to_mm100(y_points);
-    q = bufCount;
-    rec = recording;
-    interrupts();
-
-    Serial.printf("Status: Recording=%s\n", rec ? "YES" : "NO");
-    Serial.printf("Raw (points): X=%ld Y=%ld\n", (long)x_points, (long)y_points);
-    Serial.printf("Position (mm): X=%ld.%02ld Y=%ld.%02ld\n",
-                  (long)(x_mm100 / 100), (long)abs(x_mm100 % 100),
-                  (long)(y_mm100 / 100), (long)abs(y_mm100 % 100));
-    Serial.printf("Queue: %u/%u\n", q, (unsigned)QUEUE_SIZE);
-    return;
-  }
-
-  Serial.println("Unknown command. Supported: record | stop | status");
+  Serial.println("ERR UNKNOWN COMMAND");
 }
 
+/* ============================================================
+   14. SETUP
+   ============================================================ */
 
-// ---- setup ----
 void setup() {
-  // The Serial.begin and a small delay are OK; banner printed once per boot
   Serial.begin(115200);
   delay(50);
 
-  // minimal banner
-  Serial.println();
-  Serial.println("ESP8266 encoder -> mm (0.1mm resolution)");
-  Serial.printf("Queue=%u FreeHeap=%u\n", (unsigned)QUEUE_SIZE, ESP.getFreeHeap());
-  Serial.println("Commands: record | stop | status");
+  Serial.println("\nESP8266 Encoder Streaming Ready");
+  Serial.printf("Scale: %d points = %d mm\n",
+    ENCODER_SCALE.pointsPerConfiguredDistance,
+    ENCODER_SCALE.configuredDistance_mm
+  );
+  Serial.printf("Resolution: %d mm\n", SAMPLING.emitEvery_mm);
+  Serial.println("Commands: record:start | record:stop | status");
 
-  // setup pins
-  pinMode(X_A_PIN, INPUT_PULLUP);
-  pinMode(X_B_PIN, INPUT_PULLUP);
-  pinMode(Y_A_PIN, INPUT_PULLUP);
-  pinMode(Y_B_PIN, INPUT_PULLUP);
+  pinMode(X_AXIS.a, INPUT_PULLUP);
+  pinMode(X_AXIS.b, INPUT_PULLUP);
+  pinMode(Y_AXIS.a, INPUT_PULLUP);
+  pinMode(Y_AXIS.b, INPUT_PULLUP);
 
-  // initialize previous states (sample once)
-  uint32_t in = GPIO_REG_READ(GPIO_IN_ADDRESS);
-  prevX = ((in & X_A_MASK) ? 2 : 0) | ((in & X_B_MASK) ? 1 : 0);
-  prevY = ((in & Y_A_MASK) ? 2 : 0) | ((in & Y_B_MASK) ? 1 : 0);
+  uint32_t gpio = GPIO_REG_READ(GPIO_IN_ADDRESS);
+  prevXState = ((gpio & X_A_MASK) ? 2 : 0) | ((gpio & X_B_MASK) ? 1 : 0);
+  prevYState = ((gpio & Y_A_MASK) ? 2 : 0) | ((gpio & Y_B_MASK) ? 1 : 0);
 
-  // attach interrupts
-  attachInterrupt(digitalPinToInterrupt(X_A_PIN), isrX, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(X_B_PIN), isrX, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(Y_A_PIN), isrY, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(Y_B_PIN), isrY, CHANGE);
-
-  // short stabilization: let any contact bounce settle, then seed encoders and lastSentPoints
-  // This prevents pushing spurious points that are caused by contact bounce at power-up
-  uint32_t t0 = millis();
-  while (millis() - t0 < STARTUP_STABLE_MS) {
-    delay(5);
-    yield();
-  }
-
-  // sample and seed sentinel values so nothing is immediately queued on boot
-  noInterrupts();
-  int32_t sx = encX;
-  int32_t sy = encY;
-  lastSentPointsX = sx;
-  lastSentPointsY = sy;
-  interrupts();
-
-  // small extra delay to be safe (optional)
-  delay(5);
+  attachInterrupt(digitalPinToInterrupt(X_AXIS.a), handleEncoderX, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(X_AXIS.b), handleEncoderX, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(Y_AXIS.a), handleEncoderY, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(Y_AXIS.b), handleEncoderY, CHANGE);
 }
 
-// ---- main loop: sample counters and push only when >=0.5mm moved ----
+/* ============================================================
+   15. MAIN LOOP
+   ============================================================ */
+
 void loop() {
-  // handle serial commands
   if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    if (cmd.length()) handleSerialCommand(cmd);
+    processCommand(Serial.readStringUntil('\n'));
   }
 
-  // sample encoders atomically (encX/encY are in "points")
-  int32_t pointsX, pointsY;
-  noInterrupts();
-  pointsX = encX;
-  pointsY = encY;
-  interrupts();
-
-  if (recording) {
-    bool sendNow = false;
-    // initialize first time on record start (if sentinel is set)
-    if (lastSentPointsX == 0x7FFFFFFF) {
-      noInterrupts();
-      lastSentPointsX = pointsX;
-      lastSentPointsY = pointsY;
-      interrupts();
-    }
-    // if moved by threshold in either axis (points units)
-    if (abs(pointsX - lastSentPointsX) >= POINTS_PER_HALF_MM || abs(pointsY - lastSentPointsY) >= POINTS_PER_HALF_MM) {
-      sendNow = true;
-    }
-
-    if (sendNow) {
-      noInterrupts();
-      lastSentPointsX = pointsX;
-      lastSentPointsY = pointsY;
-      interrupts();
-
-      int32_t x_mm100 = points_to_mm100(pointsX);
-      int32_t y_mm100 = points_to_mm100(pointsY);
-      pushPointMain(x_mm100, y_mm100);
-    }
-  } else {
-    // when not recording, reset sentinel so next record start samples current
+  if (isRecording) {
+    int32_t x, y;
     noInterrupts();
-    lastSentPointsX = 0x7FFFFFFF;
-    lastSentPointsY = 0x7FFFFFFF;
+    x = encoderX_points;
+    y = encoderY_points;
     interrupts();
+
+    if (abs(x - lastEmittedX_points) >= POINTS_PER_EMIT_STEP ||
+        abs(y - lastEmittedY_points) >= POINTS_PER_EMIT_STEP) {
+
+      lastEmittedX_points = x;
+      lastEmittedY_points = y;
+
+      enqueuePoint(pointsToMM100(x), pointsToMM100(y));
+    }
   }
 
-  // drain queue and send (as fast as host can accept)
-  Point p;
-  while (popPointMain(p)) {
-    sendXY(p);
-    // keep the watchdog happy when emitting a bunch of data
+  PointMM100 p;
+  while (dequeuePoint(p)) {
+    sendPoint(p);
     yield();
-    delay(0);  // tiny cooperative pause
   }
 
-  // small cooperative sleep
   delay(1);
 }
-
-
-// ==============================================================
-// Debug
-/* Debug helper build - paste & flash
-   - Shows whether encX/encY change
-   - Shows raw A/B pin states periodically
-   - Use to confirm wiring / interrupts / masks
-*/
-
-// #include <Arduino.h>
-
-// // Pins
-// const uint8_t X_A_PIN = D1;  // GPIO5
-// const uint8_t X_B_PIN = D2;  // GPIO4
-// const uint8_t Y_A_PIN = D5;  // GPIO14
-// const uint8_t Y_B_PIN = D6;  // GPIO12
-
-// // Queue trivial defs (not used by debug prints)
-// #ifndef QUEUE_ORDER
-// #define QUEUE_ORDER 10
-// #endif
-// const size_t QUEUE_SIZE = (1UL << QUEUE_ORDER);
-// struct Point { int32_t x_mm100; int32_t y_mm100; };
-
-// // Globals from your code
-// volatile int32_t encX = 0;
-// volatile int32_t encY = 0;
-// volatile uint8_t prevX = 0;
-// volatile uint8_t prevY = 0;
-
-// // masks (same as your code)
-// const uint32_t X_A_MASK = digitalPinToBitMask(X_A_PIN);
-// const uint32_t X_B_MASK = digitalPinToBitMask(X_B_PIN);
-// const uint32_t Y_A_MASK = digitalPinToBitMask(Y_A_PIN);
-// const uint32_t Y_B_MASK = digitalPinToBitMask(Y_B_PIN);
-
-// // transition table
-// const int8_t transTable[16] = {
-//   0, 1, -1, 0,
-//   -1, 0, 0, 1,
-//   1, 0, 0, -1,
-//   0, -1, 1, 0
-// };
-
-// // ISR
-// ICACHE_RAM_ATTR void isrX() {
-//   uint32_t in = GPIO_REG_READ(GPIO_IN_ADDRESS);
-//   uint8_t a = (in & X_A_MASK) ? 1 : 0;
-//   uint8_t b = (in & X_B_MASK) ? 1 : 0;
-//   uint8_t curr = (a << 1) | b;
-//   uint8_t idx = (prevX << 2) | curr;
-//   int8_t d = transTable[idx];
-//   if (d != 0) {
-//     encX += d;
-//     prevX = curr;
-//   } else {
-//     if (curr != prevX) prevX = curr;
-//   }
-// }
-// ICACHE_RAM_ATTR void isrY() {
-//   uint32_t in = GPIO_REG_READ(GPIO_IN_ADDRESS);
-//   uint8_t a = (in & Y_A_MASK) ? 1 : 0;
-//   uint8_t b = (in & Y_B_MASK) ? 1 : 0;
-//   uint8_t curr = (a << 1) | b;
-//   uint8_t idx = (prevY << 2) | curr;
-//   int8_t d = transTable[idx];
-//   if (d != 0) {
-//     encY += d;
-//     prevY = curr;
-//   } else {
-//     if (curr != prevY) prevY = curr;
-//   }
-// }
-
-// void setup() {
-//   Serial.begin(115200);
-//   delay(50);
-//   Serial.println();
-//   Serial.println("DEBUG: encoder test");
-//   Serial.println("Wire X to D1/D2, Y to D5/D6. Swap to test.");
-
-//   pinMode(X_A_PIN, INPUT_PULLUP);
-//   pinMode(X_B_PIN, INPUT_PULLUP);
-//   pinMode(Y_A_PIN, INPUT_PULLUP);
-//   pinMode(Y_B_PIN, INPUT_PULLUP);
-
-//   uint32_t in = GPIO_REG_READ(GPIO_IN_ADDRESS);
-//   prevX = ((in & X_A_MASK) ? 2 : 0) | ((in & X_B_MASK) ? 1 : 0);
-//   prevY = ((in & Y_A_MASK) ? 2 : 0) | ((in & Y_B_MASK) ? 1 : 0);
-
-//   attachInterrupt(digitalPinToInterrupt(X_A_PIN), isrX, CHANGE);
-//   attachInterrupt(digitalPinToInterrupt(X_B_PIN), isrX, CHANGE);
-//   attachInterrupt(digitalPinToInterrupt(Y_A_PIN), isrY, CHANGE);
-//   attachInterrupt(digitalPinToInterrupt(Y_B_PIN), isrY, CHANGE);
-
-//   // small settle
-//   delay(100);
-// }
-
-// int32_t lastX = 0, lastY = 0;
-// uint32_t lastReport = 0;
-
-// void loop() {
-//   // show enc counts when they change
-//   noInterrupts();
-//   int32_t tx = encX;
-//   int32_t ty = encY;
-//   interrupts();
-//   if (tx != lastX || ty != lastY) {
-//     Serial.printf("enc: X=%ld, Y=%ld\n", (long)tx, (long)ty);
-//     lastX = tx; lastY = ty;
-//   }
-
-//   // every 200ms print raw pin states (helps verify A/B toggles)
-//   uint32_t now = millis();
-//   if (now - lastReport >= 200) {
-//     uint32_t in = GPIO_REG_READ(GPIO_IN_ADDRESS);
-//     uint8_t XA = (in & X_A_MASK) ? 1 : 0;
-//     uint8_t XB = (in & X_B_MASK) ? 1 : 0;
-//     uint8_t YA = (in & Y_A_MASK) ? 1 : 0;
-//     uint8_t YB = (in & Y_B_MASK) ? 1 : 0;
-//     Serial.printf("raw: XA=%d XB=%d  YA=%d YB=%d\n", XA, XB, YA, YB);
-//     lastReport = now;
-//   }
-
-//   delay(10);
-// }
-
