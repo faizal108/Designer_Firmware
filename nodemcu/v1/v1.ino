@@ -230,6 +230,21 @@ void processCommand(const String &rawCmd) {
     return;
   }
 
+  if (cmd == "point") {
+    int32_t x = encoderX_points;
+    int32_t y = encoderY_points;
+
+    int32_t x_mm100 = pointsToMM100(x);
+    int32_t y_mm100 = pointsToMM100(y);
+
+    // char xb[16], yb[16];
+    // formatMM100_AsCM(x_mm100, xb);
+    // formatMM100_AsCM(y_mm100, yb);
+
+    Serial.printf("POSITION: X=%ld.%02ld,Y=%ld.%02ld\n", pointsToMM100(x) / 100, abs(pointsToMM100(x) % 100),pointsToMM100(y) / 100, abs(pointsToMM100(y) % 100));
+    return;
+  }
+
   if (cmd == "status") {
     int32_t x = encoderX_points;
     int32_t y = encoderY_points;
@@ -272,7 +287,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(Y_AXIS.b), handleEncoderY, CHANGE);
 
   Serial.println("ESP8266 Encoder Ready");
-  Serial.println("Commands: record | stop | status | config:resolution <mm>");
+  Serial.println("Commands: record | stop | point | status | config:resolution <mm>");
 }
 
 /* ============================================================
