@@ -1,14 +1,10 @@
 /*
   ============================================================
-  ESP8266 Quadrature Encoder → Position Streaming (mm)
-  SERIAL + WIFI OUTPUT (QUEUE SAFE)
+  ESP8266 Quadrature Encoder → Position Streaming
+  DUAL OUTPUT:
+   - Serial : ASCII (debug / control)
+   - WiFi   : Binary framed (high speed)
   ============================================================
-
-  NOTE:
-  - Encoder math untouched
-  - ISR untouched
-  - Queue untouched
-  - Only output transport extended
 */
 
 #include <Arduino.h>
@@ -23,12 +19,11 @@ typedef struct {
   uint8_t a;
   uint8_t b;
 } EncoderPins;
-
 const EncoderPins X_AXIS = { D1, D2 };
 const EncoderPins Y_AXIS = { D5, D6 };
 
 /* ============================================================
-   2. ENCODER & MECHANICAL CONFIGURATION
+   2. ENCODER SCALE (UNCHANGED)
    ============================================================ */
 
 typedef struct {
@@ -36,23 +31,20 @@ typedef struct {
   int32_t configuredDistance_mm;
 } EncoderScaleConfig;
 
-const EncoderScaleConfig ENCODER_SCALE = {
-  360,
-  10
-};
+const EncoderScaleConfig ENCODER_SCALE = { 360, 10 };
 
 const int32_t POINTS_PER_MM =
   ENCODER_SCALE.pointsPerConfiguredDistance / ENCODER_SCALE.configuredDistance_mm;
 
 /* ============================================================
-   3. RUNTIME RESOLUTION CONFIGURATION
+   3. RUNTIME RESOLUTION
    ============================================================ */
 
 volatile int32_t emitStep_points = 0;
 volatile bool emitEveryPoint = false;
 
 /* ============================================================
-   4. RING BUFFER CONFIGURATION (LOCK-FREE)
+   4. LOCK-FREE RING BUFFER
    ============================================================ */
 
 #ifndef QUEUE_ORDER
@@ -92,7 +84,7 @@ volatile int32_t lastEmittedX_points = INT32_MAX;
 volatile int32_t lastEmittedY_points = INT32_MAX;
 
 /* ============================================================
-   6. FAST GPIO ACCESS
+   6. FAST GPIO
    ============================================================ */
 
 const uint32_t X_A_MASK = digitalPinToBitMask(X_AXIS.a);
@@ -101,7 +93,7 @@ const uint32_t Y_A_MASK = digitalPinToBitMask(Y_AXIS.a);
 const uint32_t Y_B_MASK = digitalPinToBitMask(Y_AXIS.b);
 
 /* ============================================================
-   7. QUADRATURE TRANSITION TABLE
+   7. QUADRATURE TABLE
    ============================================================ */
 
 const int8_t QUAD_TRANSITION[16] = {
@@ -112,14 +104,13 @@ const int8_t QUAD_TRANSITION[16] = {
 };
 
 /* ============================================================
-   8. ISR IMPLEMENTATION
+   8. ISR
    ============================================================ */
 
 ICACHE_RAM_ATTR void handleEncoderX() {
   uint32_t gpio = GPIO_REG_READ(GPIO_IN_ADDRESS);
   uint8_t curr = ((gpio & X_A_MASK) ? 2 : 0) | ((gpio & X_B_MASK) ? 1 : 0);
-  uint8_t idx = (prevXState << 2) | curr;
-  int8_t d = QUAD_TRANSITION[idx];
+  int8_t d = QUAD_TRANSITION[(prevXState << 2) | curr];
   if (d) encoderX_points += d;
   prevXState = curr;
 }
@@ -127,14 +118,13 @@ ICACHE_RAM_ATTR void handleEncoderX() {
 ICACHE_RAM_ATTR void handleEncoderY() {
   uint32_t gpio = GPIO_REG_READ(GPIO_IN_ADDRESS);
   uint8_t curr = ((gpio & Y_A_MASK) ? 2 : 0) | ((gpio & Y_B_MASK) ? 1 : 0);
-  uint8_t idx = (prevYState << 2) | curr;
-  int8_t d = QUAD_TRANSITION[idx];
+  int8_t d = QUAD_TRANSITION[(prevYState << 2) | curr];
   if (d) encoderY_points += d;
   prevYState = curr;
 }
 
 /* ============================================================
-   9. CONVERSION UTILITIES
+   9. CONVERSION
    ============================================================ */
 
 static inline int32_t pointsToMM100(int32_t points) {
@@ -144,44 +134,28 @@ static inline int32_t pointsToMM100(int32_t points) {
 }
 
 /* ============================================================
-   10. LOCK-FREE RING BUFFER
+   10. QUEUE OPS
    ============================================================ */
 
-void enqueuePoint(int32_t x_mm100, int32_t y_mm100) {
+void enqueuePoint(int32_t x, int32_t y) {
   uint32_t next = RING_NEXT(bufferHead);
-
   if (next == bufferTail) {
     bufferTail = RING_NEXT(bufferTail);
     droppedPoints++;
   }
-
-  ringBuffer[bufferHead].x = x_mm100;
-  ringBuffer[bufferHead].y = y_mm100;
+  ringBuffer[bufferHead] = { x, y };
   bufferHead = next;
 }
 
 bool dequeuePoint(PointMM100 *out) {
   if (bufferHead == bufferTail) return false;
-
-  out->x = ringBuffer[bufferTail].x;
-  out->y = ringBuffer[bufferTail].y;
+  *out = ringBuffer[bufferTail];
   bufferTail = RING_NEXT(bufferTail);
   return true;
 }
 
 /* ============================================================
-   11. OUTPUT MODES
-   ============================================================ */
-
-enum OutputMode {
-  OUTPUT_SERIAL,
-  OUTPUT_WIFI
-};
-
-volatile OutputMode outputMode = OUTPUT_SERIAL;
-
-/* ============================================================
-   12. WIFI STATE
+   11. WIFI STATE
    ============================================================ */
 
 WiFiServer wifiServer(9000);
@@ -192,31 +166,40 @@ char wifiPASS[32] = { 0 };
 bool wifiEnabled = false;
 
 /* ============================================================
-   13. OUTPUT IMPLEMENTATION
+   12. ASCII SERIAL OUTPUT
    ============================================================ */
 
-void sendPointSerial(const PointMM100 *p) {
+void sendAsciiSerial(const PointMM100 *p) {
   Serial.printf(
     "%ld.%02ld,%ld.%02ld\n",
     p->x / 100, abs(p->x % 100),
     p->y / 100, abs(p->y % 100));
 }
 
-void sendPointWifi(const PointMM100 *p) {
-  if (!wifiClient || !wifiClient.connected()) return;
+/* ============================================================
+   13. BINARY WIFI OUTPUT
+   ============================================================ */
 
-  wifiClient.printf(
-    "%ld.%02ld,%ld.%02ld\n",
-    p->x / 100, abs(p->x % 100),
-    p->y / 100, abs(p->y % 100));
+uint8_t crc8(const uint8_t *buf, uint8_t len) {
+  uint8_t c = 0;
+  while (len--) c ^= *buf++;
+  return c;
 }
 
-void sendPoint(const PointMM100 *p) {
-  if (outputMode == OUTPUT_WIFI) {
-    sendPointWifi(p);
-  } else {
-    sendPointSerial(p);
-  }
+void sendBinaryWifi(const PointMM100 *p) {
+  if (!wifiClient || !wifiClient.connected()) return;
+
+  uint8_t frame[13];
+  frame[0] = 0xAA;
+  frame[1] = 0x55;
+  frame[2] = 0x01;
+  frame[3] = 8;
+
+  memcpy(&frame[4], &p->x, 4);
+  memcpy(&frame[8], &p->y, 4);
+
+  frame[12] = crc8(frame, 12);
+  wifiClient.write(frame, sizeof(frame));
 }
 
 /* ============================================================
@@ -232,13 +215,8 @@ void startWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID, wifiPASS);
 
-  Serial.print("WIFI CONNECTING");
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(200);
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("ERR WIFI CONNECT FAILED");
@@ -247,21 +225,12 @@ void startWifi() {
 
   wifiServer.begin();
   wifiEnabled = true;
-
   Serial.print("OK WIFI IP ");
   Serial.println(WiFi.localIP());
 }
 
-void stopWifi() {
-  if (wifiClient) wifiClient.stop();
-  wifiServer.stop();
-  WiFi.disconnect(true);
-  wifiEnabled = false;
-  Serial.println("OK WIFI STOPPED");
-}
-
 /* ============================================================
-   15. RESOLUTION HANDLING
+   15. RESOLUTION
    ============================================================ */
 
 void updateResolutionFromMM(float mm) {
@@ -276,11 +245,10 @@ void updateResolutionFromMM(float mm) {
 }
 
 /* ============================================================
-   16. COMMAND PROCESSOR
+   16. COMMANDS (SERIAL ONLY)
    ============================================================ */
 
-void processCommand(const String &rawCmd) {
-  String cmd = rawCmd;
+void processCommand(String cmd) {
   cmd.trim();
   cmd.toLowerCase();
 
@@ -302,76 +270,23 @@ void processCommand(const String &rawCmd) {
   }
 
   if (cmd.startsWith("config:resolution")) {
-    int sp = cmd.indexOf(' ');
-    if (sp < 0) {
-      Serial.println("ERR MISSING VALUE");
-      return;
-    }
-    float mm = cmd.substring(sp + 1).toFloat();
+    float mm = cmd.substring(cmd.indexOf(' ') + 1).toFloat();
     updateResolutionFromMM(mm);
     Serial.printf("OK RESOLUTION %.3f mm\n", mm);
-    return;
-  }
-
-  if (cmd == "point") {
-    int32_t x = encoderX_points;
-    int32_t y = encoderY_points;
-    Serial.printf("POSITION: X=%ld.%02ld,Y=%ld.%02ld\n",
-                  pointsToMM100(x) / 100, abs(pointsToMM100(x) % 100),
-                  pointsToMM100(y) / 100, abs(pointsToMM100(y) % 100));
-    return;
-  }
-
-  if (cmd == "status") {
-    int32_t x = encoderX_points;
-    int32_t y = encoderY_points;
-    Serial.printf(
-      "STATUS | raw=(%ld,%ld) | mm=(%ld.%02ld,%ld.%02ld) | q=%u | drop=%u | step=%dpt\n",
-      x, y,
-      pointsToMM100(x) / 100, abs(pointsToMM100(x) % 100),
-      pointsToMM100(y) / 100, abs(pointsToMM100(y) % 100),
-      ringCount(),
-      droppedPoints,
-      emitStep_points);
     return;
   }
 
   if (cmd.startsWith("wifi:config")) {
     int a = cmd.indexOf(' ');
     int b = cmd.indexOf(' ', a + 1);
-    if (a < 0 || b < 0) {
-      Serial.println("ERR WIFI CONFIG FORMAT");
-      return;
-    }
-    cmd.substring(a + 1, b).toCharArray(wifiSSID, sizeof(wifiSSID));
-    cmd.substring(b + 1).toCharArray(wifiPASS, sizeof(wifiPASS));
+    cmd.substring(a + 1, b).toCharArray(wifiSSID, 32);
+    cmd.substring(b + 1).toCharArray(wifiPASS, 32);
     Serial.println("OK WIFI CONFIG SAVED");
     return;
   }
 
   if (cmd == "wifi:on") {
     startWifi();
-    return;
-  }
-
-  if (cmd == "wifi:off") {
-    stopWifi();
-    return;
-  }
-
-  if (cmd == "output:serial") {
-    outputMode = OUTPUT_SERIAL;
-    Serial.println("OK OUTPUT SERIAL");
-    return;
-  }
-
-  if (cmd == "output:wifi") {
-    if (!wifiEnabled) {
-      Serial.println("ERR WIFI NOT STARTED");
-      return;
-    }
-    outputMode = OUTPUT_WIFI;
-    Serial.println("OK OUTPUT WIFI");
     return;
   }
 
@@ -402,33 +317,27 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(Y_AXIS.a), handleEncoderY, CHANGE);
   attachInterrupt(digitalPinToInterrupt(Y_AXIS.b), handleEncoderY, CHANGE);
 
-  Serial.println("ESP8266 Encoder Ready");
+  Serial.println("ESP8266 Encoder Ready (Dual Output)");
 }
 
 /* ============================================================
-   18. MAIN LOOP
+   18. LOOP
    ============================================================ */
 
 void loop() {
-  if (Serial.available()) {
+  if (Serial.available())
     processCommand(Serial.readStringUntil('\n'));
-  }
 
   if (wifiEnabled && !wifiClient) {
     wifiClient = wifiServer.available();
-    if (wifiClient) {
-      Serial.println("OK WIFI CLIENT CONNECTED");
-    }
+    if (wifiClient) Serial.println("OK WIFI CLIENT CONNECTED");
   }
 
   if (isRecording) {
     int32_t x = encoderX_points;
     int32_t y = encoderY_points;
 
-    bool emit =
-      emitEveryPoint
-        ? (x != lastEmittedX_points || y != lastEmittedY_points)
-        : (abs(x - lastEmittedX_points) >= emitStep_points || abs(y - lastEmittedY_points) >= emitStep_points);
+    bool emit = emitEveryPoint ? (x != lastEmittedX_points || y != lastEmittedY_points) : (abs(x - lastEmittedX_points) >= emitStep_points || abs(y - lastEmittedY_points) >= emitStep_points);
 
     if (emit) {
       lastEmittedX_points = x;
@@ -438,10 +347,11 @@ void loop() {
   }
 
   PointMM100 p;
-  uint8_t burst = (outputMode == OUTPUT_WIFI) ? 4 : 32;
+  uint8_t burst = wifiEnabled ? 4 : 32;
 
   while (burst-- && dequeuePoint(&p)) {
-    sendPoint(&p);
+    sendAsciiSerial(&p);
+    sendBinaryWifi(&p);
     yield();
   }
 
